@@ -5,6 +5,8 @@ import base64
 import json
 import time
 import urllib3
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from Crypto.Cipher import AES
 from urllib.parse import urljoin
 
@@ -16,6 +18,8 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 SECRET_KEY = "Ak7qrvvH4WKYxV2OgaeHAEg2a5eh16vE"
 session = requests.Session()
 session.headers.update(HEADERS)
+ARCHIVO_JSON = "peliculas_con_reproductores.json"
+MAX_WORKERS = 5  # Número de hilos para procesamiento paralelo
 
 # --- AES helper ---
 def decrypt_link(encrypted_b64: str, secret_key: str) -> str:
@@ -29,30 +33,36 @@ def decrypt_link(encrypted_b64: str, secret_key: str) -> str:
     decrypted = decrypted[:-pad_len]
     return decrypted.decode("utf-8")
 
+# --- Función para cargar películas existentes ---
+def cargar_peliculas_existentes():
+    if not os.path.exists(ARCHIVO_JSON):
+        return {}
+    
+    try:
+        with open(ARCHIVO_JSON, "r", encoding="utf-8") as f:
+            peliculas_existentes = json.load(f)
+        # Crear un diccionario con URL como clave para búsqueda rápida
+        return {peli["url"]: peli for peli in peliculas_existentes}
+    except (json.JSONDecodeError, FileNotFoundError):
+        return {}
+
 # --- Scrap funciones ---
-def obtener_peliculas_pagina(num_pagina):
-    print(f"🔍 Obteniendo lista de películas de la página {num_pagina}...")
+def obtener_urls_peliculas_pagina(num_pagina):
+    print(f"🔍 Obteniendo URLs de películas de la página {num_pagina}...")
     url = PELIS_URL_TEMPLATE.format(num_pagina)
     r = session.get(url, verify=False)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-    peliculas = []
+    urls_peliculas = []
+    
     for a in soup.select("a.Posters-link"):
-        titulo = (a.get("data-title") or a.get("title") or a.text.strip()).replace("VER ", "").strip()
         enlace = a.get("href")
         if enlace and not enlace.startswith("http"):
             enlace = urljoin(BASE_URL, enlace)
-        peliculas.append({"titulo": titulo, "url": enlace})
-    print(f"  → Encontradas {len(peliculas)} películas en la página {num_pagina}.")
-    return peliculas
-
-def obtener_peliculas(num_paginas):
-    todas_peliculas = []
-    for pagina in range(1, num_paginas + 1):
-        peliculas_pagina = obtener_peliculas_pagina(pagina)
-        todas_peliculas.extend(peliculas_pagina)
-        time.sleep(1)  # Pequeña pausa entre páginas para no sobrecargar
-    return todas_peliculas
+        urls_peliculas.append(enlace)
+    
+    print(f"  → Encontradas {len(urls_peliculas)} películas en la página {num_pagina}.")
+    return urls_peliculas
 
 def obtener_iframe_pelicula(html: str):
     soup = BeautifulSoup(html, "html.parser")
@@ -192,20 +202,20 @@ def extraer_detalles_pelicula(html: str):
     
     return detalles
 
-def procesar_pelicula(pelicula):
-    print(f"🎬 Procesando: {pelicula['titulo']}")
+def procesar_pelicula(url_pelicula):
     try:
-        r = session.get(pelicula["url"], verify=False)
+        r = session.get(url_pelicula, verify=False)
         r.raise_for_status()
         
         # Extraer detalles de la ficha
         detalles = extraer_detalles_pelicula(r.text)
+        pelicula = {"url": url_pelicula}
         pelicula.update(detalles)
         
         # Obtener iframe
         iframe_url = obtener_iframe_pelicula(r.text)
         if not iframe_url:
-            print("  ❌ No se encontró iframe en la página de la película.")
+            print(f"  ❌ No se encontró iframe en la página de la película: {detalles.get('titulo', url_pelicula)}")
             pelicula["reproductores"] = []
             return pelicula
         
@@ -214,32 +224,101 @@ def procesar_pelicula(pelicula):
         r_iframe.raise_for_status()
         reproductores = extraer_dataLink(r_iframe.text)
         pelicula["reproductores"] = reproductores
+        
+        return pelicula
     except Exception as e:
-        print(f"  ❌ Error: {e}")
-        pelicula["reproductores"] = []
-    return pelicula
+        print(f"  ❌ Error procesando {url_pelicula}: {e}")
+        # Devolver una película básica con el error
+        return {
+            "url": url_pelicula,
+            "titulo": f"ERROR: {str(e)}",
+            "reproductores": []
+        }
 
-def guardar_en_json(data, archivo="peliculas_con_reproductores.json"):
+def guardar_en_json(data, archivo=ARCHIVO_JSON):
     with open(archivo, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
     print(f"✅ Guardado en {archivo}")
 
 # --- Main ---
 def main(num_paginas=1):
-    print(f"🚀 Iniciando scraping de {num_paginas} página(s)...")
-    peliculas = obtener_peliculas(num_paginas)
-    print(f"📋 Total de películas encontradas: {len(peliculas)}")
+    print(f"🚀 Iniciando scraping de {num_paginas} página(s) con {MAX_WORKERS} hilos...")
     
-    resultados = []
-    for i, peli in enumerate(peliculas, 1):
-        print(f"Procesando película {i}/{len(peliculas)}")
-        resultado = procesar_pelicula(peli)
-        resultados.append(resultado)
-        time.sleep(2)  # evita sobrecarga
+    # Cargar películas existentes
+    peliculas_existentes_dict = cargar_peliculas_existentes()
+    print(f"📁 Cargadas {len(peliculas_existentes_dict)} películas existentes desde {ARCHIVO_JSON}")
+    
+    resultados_finales = []
+    nuevas_procesadas = 0
+    existentes_reutilizadas = 0
+    
+    # Recorrer cada página en orden
+    for pagina in range(1, num_paginas + 1):
+        print(f"\n📄 Procesando página {pagina}/{num_paginas}...")
         
-    guardar_en_json(resultados)
+        # Obtener URLs de películas de esta página
+        urls_peliculas = obtener_urls_peliculas_pagina(pagina)
+        
+        # Separar películas nuevas y existentes
+        urls_nuevas = []
+        peliculas_ordenadas = []
+        
+        for url_pelicula in urls_peliculas:
+            if url_pelicula in peliculas_existentes_dict:
+                # La película ya existe, la reutilizamos
+                pelicula = peliculas_existentes_dict[url_pelicula]
+                peliculas_ordenadas.append(pelicula)
+                existentes_reutilizadas += 1
+            else:
+                # La película no existe, la agregamos a la lista de nuevas
+                urls_nuevas.append(url_pelicula)
+                # Marcamos un placeholder para mantener el orden
+                peliculas_ordenadas.append(None)
+        
+        print(f"  → {len(urls_nuevas)} películas nuevas para procesar")
+        print(f"  → {existentes_reutilizadas} películas existentes reutilizadas")
+        
+        # Procesar películas nuevas en paralelo
+        if urls_nuevas:
+            print(f"  ⚡ Procesando {len(urls_nuevas)} películas nuevas en paralelo...")
+            
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                # Crear un diccionario para mapear futuros a sus URLs
+                future_to_url = {executor.submit(procesar_pelicula, url): url for url in urls_nuevas}
+                
+                # Procesar resultados a medida que se completan
+                for future in as_completed(future_to_url):
+                    url = future_to_url[future]
+                    try:
+                        pelicula = future.result()
+                        nuevas_procesadas += 1
+                        
+                        # Encontrar el índice de esta URL en la lista original y reemplazar el placeholder
+                        indice = urls_peliculas.index(url)
+                        peliculas_ordenadas[indice] = pelicula
+                        
+                        print(f"    ✅ Completada: {pelicula.get('titulo', url)}")
+                    except Exception as e:
+                        print(f"    ❌ Error en {url}: {e}")
+        
+        # Agregar todas las películas de esta página a los resultados finales
+        for pelicula in peliculas_ordenadas:
+            if pelicula is not None:
+                resultados_finales.append(pelicula)
+        
+        # Pausa entre páginas (más corta ahora)
+        if pagina < num_paginas:
+            print(f"⏳ Pausa corta antes de la siguiente página...")
+            time.sleep(0.5)  # Reducido a 0.5 segundos
+    
+    print(f"\n📊 Estadísticas finales:")
+    print(f"  - Películas nuevas procesadas: {nuevas_procesadas}")
+    print(f"  - Películas existentes reutilizadas: {existentes_reutilizadas}")
+    print(f"  - Total de películas en el archivo: {len(resultados_finales)}")
+    
+    guardar_en_json(resultados_finales)
     print("✅ Proceso completado!")
 
 if __name__ == "__main__":
     # Cambia num_paginas para más páginas (cada página tiene 24 películas)
-    main(num_paginas=3)  # Por ejemplo, 3 páginas = 72 películas
+    main(num_paginas=200)  # Por ejemplo, 3 páginas = 72 películas
